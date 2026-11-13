@@ -1,6 +1,7 @@
 {
-  "name": "agent-dtmf-webhook",
+  "name": "agentphone-webhook-node",
   "version": "1.0.0",
+  "description": "AgentPhone Node.js Webhook with live log viewer",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
