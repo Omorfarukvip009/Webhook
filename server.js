@@ -1,210 +1,158 @@
-const express = require('express');
+const express = require("express");
+
 const app = express();
 app.use(express.json());
-
-// Track active call states
-const callStates = {};
-
-const ENCODING_TABLE = {
-    "0": "Zuri", "1": "Uni", "2": "Tuwi", "3": "Thuri", "4": "Furi",
-    "5": "Fivi", "6": "Siji", "7": "Sivini", "8": "Eigti", "9": "Nini"
-};
-
-const WORD_TO_DIGIT = {
-    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
-};
-
-function extractAllDigits(text) {
-    if (!text) return [];
-    const textLower = text.toLowerCase();
-    const regex = /\b(zero|one|two|three|four|five|six|seven|eight|nine|[0-9])\b/g;
-    const matches = textLower.match(regex) || [];
-    const digits = [];
-    for (const m of matches) {
-        if (!isNaN(m)) {
-            digits.push(m);
-        } else if (WORD_TO_DIGIT[m]) {
-            digits.push(WORD_TO_DIGIT[m]);
-        }
-    }
-    return digits;
-}
-
-app.post('/webhook', (req, res) => {
-    try {
-        const payload = req.body || {};
-        const data = payload.data || payload;
-        
-        const callId = data.call_id || data.id;
-        const transcript = data.transcript || data.text || "";
-        
-        if (!callId) {
-            return res.json({ status: "ignored" });
-        }
-
-        const timestamp = new Date().toISOString();
-
-        if (!callStates[callId]) {
-            callStates[callId] = {
-                call_id: callId,
-                phase: 1, // Start strictly at Phase 1
-                captured_digits: [],
-                last_processed_text: "",
-                transcript: transcript,
-                status: "In Progress",
-                updated_at: timestamp
-            };
-        }
-
-        const state = callStates[callId];
-        state.transcript = transcript;
-        state.updated_at = timestamp;
-
-        if (transcript === state.last_processed_text) {
-            return res.json({ status: "no_change" });
-        }
-        
-        state.last_processed_text = transcript;
-        const allFoundDigits = extractAllDigits(transcript);
-
-        // -------------------------------------------------------------
-        // PHASE 1: DETECT AND PRESS THE FIRST DIGIT
-        // -------------------------------------------------------------
-        if (state.phase === 1) {
-            if (allFoundDigits.length > 0) {
-                const firstDigit = allFoundDigits[0];
-                state.phase = 2; // Advance to Phase 2 ONLY after capturing/pressing the first digit
-                
-                // If extra digits were spoken in the same sentence, queue them for Phase 2
-                const remainingDigits = allFoundDigits.slice(1);
-                if (remainingDigits.length > 0) {
-                    state.captured_digits.push(...remainingDigits);
-                }
-
-                console.log(`[Phase 1] Pressing first digit: ${firstDigit}`);
-
-                // Return ONLY the press_digit action. DO NOT include end_call here.
-                return res.json({
-                    action: "press_digit",
-                    digit: firstDigit,
-                    text: ""
-                });
-            }
-            // Keep listening silently if no digit is found yet
-            return res.json({ text: "" });
-        }
-
-        // -------------------------------------------------------------
-        // PHASE 2 & 3: CAPTURE NEXT 6 DIGITS & ENCODE
-        // -------------------------------------------------------------
-        else if (state.phase === 2) {
-            const currentCount = state.captured_digits.length;
-            const needed = 6 - currentCount;
-            
-            if (needed > 0 && allFoundDigits.length > 0) {
-                // Ensure we pull new digits beyond what was already gathered
-                const newDigits = allFoundDigits.slice(currentCount);
-                if (newDigits.length > 0) {
-                    state.captured_digits.push(...newDigits.slice(0, needed));
-                }
-            }
-
-            console.log(`[Phase 2] Captured digits count: ${state.captured_digits.length}/6 -> [${state.captured_digits.join('')}]`);
-
-            // Only trigger encoding and hanging up once we have EXACTLY 6 digits
-            if (state.captured_digits.length >= 6) {
-                const sixDigits = state.captured_digits.slice(0, 6);
-                state.phase = 3;
-                state.status = "Completed & Hung Up";
-                
-                const encodedWords = sixDigits.map(d => ENCODING_TABLE[d]).filter(Boolean);
-                const responseText = encodedWords.join(" ");
-                state.final_response = responseText;
-                
-                console.log(`[Phase 3] Speaking words and ending call: ${responseText}`);
-
-                return res.json({
-                    text: responseText,
-                    end_call: true
-                });
-            } else {
-                // Still collecting digits, stay silent
-                return res.json({ text: "" });
-            }
-        }
-
-        return res.json({ status: "ok" });
-
-    } catch (e) {
-        console.error("Webhook Error:", e);
-        return res.status(500).json({ status: "error", message: e.message });
-    }
-});
-
-// --- URL LOG VIEWER ENDPOINTS ---
-app.get('/logs', (req, res) => {
-    const html = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>AgentPhone Webhook Logs</title>
-        <meta http-equiv="refresh" content="5">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; }
-            h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
-            p { color: #94a3b8; font-size: 0.875rem; margin-bottom: 1.5rem; }
-            table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; }
-            th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #334155; font-size: 0.9rem; }
-            th { background: #334155; color: #e2e8f0; font-weight: 600; }
-            tr:hover { background: #273548; }
-            .badge-completed { background: #065f46; color: #34d399; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }
-            .badge-progress { background: #1e3a8a; color: #60a5fa; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }
-        </style>
-    </head>
-    <body>
-        <h1>Live Webhook Call Logs (System Operational)</h1>
-        <p>Auto-refreshes every 5 seconds. Showing active and recent call states.</p>
-        <table>
-            <thead>
-                <tr>
-                    <th>Call ID</th>
-                    <th>Status / Phase</th>
-                    <th>Captured Digits</th>
-                    <th>Latest Transcript</th>
-                    <th>Final Response Spoken</th>
-                    <th>Last Updated</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${Object.keys(callStates).length === 0 ? '<tr><td colspan="6" style="text-align: center; color: #64748b; padding: 2rem;">No calls recorded yet. Place a test call to see logs here.</td></tr>' : 
-                Object.entries(callStates).map(([cid, data]) => `
-                    <tr>
-                        <td><code>${cid}</code></td>
-                        <td><span class="${data.phase === 3 ? 'badge-completed' : 'badge-progress'}">${data.status}</span></td>
-                        <td><strong>${data.captured_digits.join('')}</strong></td>
-                        <td>${data.transcript}</td>
-                        <td><span style="color: #38bdf8;">${data.final_response || '-'}</span></td>
-                        <td>${data.updated_at}</td>
-                    </tr>
-                `).join('')}
-            </tbody>
-        </table>
-    </body>
-    </html>
-    `;
-    res.send(html);
-});
-
-app.get('/logs/json', (req, res) => {
-    res.json(callStates);
-});
-
-app.get('/health', (req, res) => {
-    res.json({ status: "healthy", system: "operational" });
-});
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
+
+/* ============================================================
+   ENCODED DIGIT WORDS  (0–9)
+   ============================================================ */
+const ENCODED = {
+  "0": "Zuri",
+  "1": "Uni",
+  "2": "Tuwi",
+  "3": "Thuri",
+  "4": "Furi",
+  "5": "Fivi",
+  "6": "Siji",
+  "7": "Sivini",
+  "8": "Eigti",
+  "9": "Nini",
+};
+
+/* Convert a digit string → encoded spoken phrase
+   "5123" → "Fivi, Uni, Tuwi, Thuri" */
+function encodeDigits(digits) {
+  return digits
+    .split("")
+    .map((d) => ENCODED[d] || d)
+    .join(", ");
+}
+
+/* ============================================================
+   TRANSCRIPT → DIGITS EXTRACTION
+   Handles digits ("5123"), spoken numbers ("five one two"),
+   and even the encoded words themselves ("Fivi Uni Tuwi")
+   ============================================================ */
+const WORD_TO_DIGIT = {
+  // standard spoken numbers
+  zero: "0", oh: "0",
+  one: "1",
+  two: "2", to: "2", too: "2",
+  three: "3",
+  four: "4", for: "4",
+  five: "5",
+  six: "6",
+  seven: "7",
+  eight: "8", ate: "8",
+  nine: "9",
+  // encoded words (in case IVR/system speaks them back)
+  zuri: "0",
+  uni: "1",
+  tuwi: "2",
+  thuri: "3",
+  furi: "4",
+  fivi: "5",
+  siji: "6",
+  sivini: "7",
+  eigti: "8",
+  nini: "9",
+};
+
+function extractDigits(text) {
+  if (!text) return "";
+  const tokens = String(text).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  let out = "";
+  for (const t of tokens) {
+    const nums = t.match(/\d/g);          // "5" or "12"
+    if (nums) { out += nums.join(""); continue; }
+    if (WORD_TO_DIGIT[t]) out += WORD_TO_DIGIT[t];
+  }
+  return out;
+}
+
+/* ============================================================
+   PER-CALL STATE  (in-memory; see README for Redis note)
+   ============================================================ */
+const calls = new Map();
+
+function getState(callId) {
+  if (!calls.has(callId)) {
+    calls.set(callId, { pressedFirst: false, ts: Date.now() });
+  }
+  const s = calls.get(callId);
+  s.ts = Date.now();
+  return s;
+}
+
+// Evict stale calls every 5 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 5 * 60 * 1000;
+  for (const [id, s] of calls) {
+    if (s.ts < cutoff) calls.delete(id);
+  }
+}, 60 * 1000);
+
+/* ============================================================
+   WEBHOOK  POST /webhook
+   AgentPhone sends agent.message events with data.transcript
+   ============================================================ */
+app.post("/webhook", (req, res) => {
+  const body = req.body || {};
+
+  // Ignore non-message events (call.start, call.end, etc.)
+  const event = body.event || body.type || "";
+  if (event && !/message/i.test(event)) {
+    return res.json({});
+  }
+
+  const data = body.data || body;
+  const callId =
+    data.callId || data.call_id || body.callId || body.sessionId || "default-call";
+  const transcript = data.transcript || data.text || "";
+  const rawDigits = data.digits || ""; // in case platform sends keypad digits directly
+
+  let digits = extractDigits(transcript);
+  if (!digits && rawDigits) digits = rawDigits.replace(/\D/g, "");
+
+  // No digits heard — nudge the caller
+  if (!digits) {
+    return res.json({ text: "Please say the digits." });
+  }
+
+  const state = getState(callId);
+
+  /* ----------------------------------------------------------
+     PHASE 1 — first digits heard:
+     PRESS the first digit (DTMF) and SPEAK the rest encoded
+     ---------------------------------------------------------- */
+  if (!state.pressedFirst) {
+    const first = digits[0];
+    const rest = digits.slice(1);
+    state.pressedFirst = true;
+
+    const response = { digits: first };        // ← press first digit
+    if (rest.length > 0) {
+      response.text = encodeDigits(rest);      // ← speak the NEXT digits
+    }
+    return res.json(response);
+  }
+
+  /* ----------------------------------------------------------
+     PHASE 2 — more digits arrive later:
+     speak them encoded (first digit already pressed)
+     ---------------------------------------------------------- */
+  return res.json({ text: encodeDigits(digits) });
+});
+
+/* ============================================================
+   HEALTH CHECKS  (Render requires / to respond 200)
+   ============================================================ */
+app.get("/", (_req, res) => res.send("AgentPhone encoded-digits webhook OK"));
+app.get("/webhook", (_req, res) => res.json({ ok: true })); // platform verification
+
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  console.log(`Webhook listening on port ${PORT}`);
 });
