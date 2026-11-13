@@ -38,15 +38,15 @@ function encodeDigits(digits) {
    ============================================================ */
 const WORD_TO_DIGIT = {
   // standard spoken numbers
-  zero: "0", oh: "0",
+  zero: "0",
   one: "1",
-  two: "2", to: "2", too: "2",
+  two: "2",
   three: "3",
-  four: "4", for: "4",
+  four: "4",
   five: "5",
   six: "6",
   seven: "7",
-  eight: "8", ate: "8",
+  eight: "8",
   nine: "9",
   // encoded words (in case IVR/system speaks them back)
   zuri: "0",
