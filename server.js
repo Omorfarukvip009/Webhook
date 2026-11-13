@@ -37,7 +37,7 @@ function getPressDigit(text) {
 // ── CALL STATE ──
 const calls = new Map();
 function getState(id) {
-  if (!calls.has(id)) calls.set(id, { pressed: false, code: "", ts: Date.now() });
+  if (!calls.has(id)) calls.set(id, { pressCount: 0, pressDigit: "", code: "", ts: Date.now() });
   const s = calls.get(id); s.ts = Date.now(); return s;
 }
 setInterval(() => { const c = Date.now()-300000; for (const [id,s] of calls) if (s.ts<c) calls.delete(id); }, 60000);
@@ -53,7 +53,9 @@ function log(badge,color,title,d={}) {
 function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 
 // ══════════════════════════════════════════════
-//  WEBHOOK — ONLY PRESS & SPEAK
+//  WEBHOOK
+//  Phase 1: Press digit 3 times
+//  Phase 2: Capture 6 digits & speak encoded
 // ══════════════════════════════════════════════
 app.post("/webhook", (req, res) => {
   const body = req.body || {};
@@ -65,20 +67,23 @@ app.post("/webhook", (req, res) => {
   const transcript = data.transcript || "";
   const state = getState(callId);
 
-  // ── STEP 1: PRESS first digit ──
-  if (!state.pressed) {
+  // ── PHASE 1: PRESS digit (3 times) ──
+  if (state.pressCount < 3) {
     const digit = getPressDigit(transcript) || getDigits(transcript)[0] || null;
     if (!digit) return res.json({ text: "Listening." });
 
-    state.pressed = true;
+    state.pressCount++;
+    state.pressDigit = digit;
     stats.pressed++;
-    log("PRESSED","amber",`Pressed ${digit}`,{ callId, transcript, digit, raw:body });
 
-    // Docs require text + digits together
+    log("PRESSED","amber",`Pressed ${digit} (${state.pressCount}/3)`,{
+      callId, transcript, digit, pressCount:state.pressCount, raw:body
+    });
+
     return res.json({ text: `Pressing ${digit}.`, digits: digit });
   }
 
-  // ── STEP 2: SPEAK next digits encoded ──
+  // ── PHASE 2: CAPTURE & SPEAK encoded digits ──
   const digits = getDigits(transcript);
   if (!digits) return res.json({ text: "Listening for code." });
 
@@ -89,7 +94,11 @@ app.post("/webhook", (req, res) => {
     state.code = "";
     stats.spoken++;
     const spoken = encoded(six);
-    log("SPOKE","green",`Spoke ${six} → ${spoken}`,{ callId, transcript, digits:six, spoken, raw:body });
+
+    log("SPOKE","green",`${six} → ${spoken}`,{
+      callId, transcript, digits:six, spoken, raw:body
+    });
+
     return res.json({ text: spoken });
   }
 
@@ -122,7 +131,6 @@ h1{font-size:20px;margin-bottom:16px;display:flex;align-items:center;gap:8px}
 .amber{background:rgba(245,158,11,.15);color:#fbbf24;border:1px solid rgba(245,158,11,.3)}
 .green{background:rgba(16,185,129,.15);color:#34d399;border:1px solid rgba(16,185,129,.3)}
 .blue{background:rgba(59,130,246,.15);color:#60a5fa;border:1px solid rgba(59,130,246,.3)}
-.gray{background:rgba(113,113,122,.15);color:#a1a1aa;border:1px solid rgba(113,113,122,.3)}
 .row{background:#0c0c0e;border:1px solid #1a1a1e;border-radius:6px;padding:8px 12px;font-size:12px;margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .lbl{color:#a1a1aa;min-width:80px}
 .txt{color:#e4e4e7;font-style:italic}
@@ -133,7 +141,7 @@ code{background:#1a1a2e;color:#fbbf24;padding:2px 6px;border-radius:4px;font-siz
 details{margin-top:6px}summary{font-size:11px;color:#71717a;cursor:pointer}
 pre{margin-top:4px;background:#09090b;border:1px solid #1a1a1e;padding:8px;border-radius:6px;font-size:11px;color:#71717a;overflow-x:auto}
 </style></head><body>
-<h1><span class="dot"></span>AgentPhone — Press & Speak</h1>
+<h1><span class="dot"></span>AgentPhone — Press (×3) & Speak</h1>
 <div class="bar">
   <a href="/logs" class="btn b1">🔄 Refresh</a>
   <a href="/logs/clear" class="btn b2">🗑️ Clear</a>
@@ -156,7 +164,7 @@ ${logs.length===0?'<p style="color:#71717a;text-align:center;padding:40px">No ac
       <span class="meta">${t}</span>
     </div>
     ${l.transcript?`<div class="row"><span class="lbl">🎙️ Heard:</span><span class="txt">"${esc(l.transcript)}"</span></div>`:""}
-    ${l.digit?`<div class="row"><span class="lbl">📤 Sent:</span><code>{"text":"Pressing ${esc(l.digit)}.","digits":"${esc(l.digit)}"}</code></div>`:""}
+    ${l.digit?`<div class="row"><span class="lbl">📤 Sent:</span><code>{"text":"Pressing ${esc(l.digit)}.","digits":"${esc(l.digit)}"}</code> <span style="color:#fbbf24">(${l.pressCount}/3)</span></div>`:""}
     ${l.digits?`<div class="row"><span class="lbl">🔐 Code:</span><div style="display:flex;gap:4px">${pills}</div></div>`:""}
     ${l.spoken?`<div class="row"><span class="lbl">🗣️ Spoke:</span><span class="enc">${esc(l.spoken)}</span></div>`:""}
     <details><summary>Raw</summary><pre>${esc(JSON.stringify(l.raw,null,2))}</pre></details>
