@@ -200,9 +200,24 @@ app.get("/logs", (req, res) => {
     <html>
     <head>
       <title>Webhook Logs</title>
-      <meta http-equiv="refresh" content="3">
       <style>
         body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+        .toolbar { margin-bottom: 20px; display: flex; gap: 12px; }
+        .btn {
+          padding: 8px 16px;
+          font-family: monospace;
+          font-size: 14px;
+          font-weight: bold;
+          border: none;
+          border-radius: 4px;
+          cursor: pointer;
+          text-decoration: none;
+          display: inline-block;
+        }
+        .btn-refresh { background: #0a0; color: #fff; }
+        .btn-refresh:hover { background: #0c0; }
+        .btn-clear { background: #c00; color: #fff; }
+        .btn-clear:hover { background: #e00; }
         .entry { border-bottom: 1px solid #333; padding: 10px 0; }
         .time { color: #888; }
         .type { color: #ff0; font-weight: bold; }
@@ -210,8 +225,11 @@ app.get("/logs", (req, res) => {
       </style>
     </head>
     <body>
-      <h2>📡 AgentPhone Webhook Live Logs (Auto-refreshes every 3s)</h2>
-      <p><a href="/logs/clear" style="color:#f55;">[Clear Logs]</a></p>
+      <h2>📡 AgentPhone Webhook Logs</h2>
+      <div class="toolbar">
+        <a href="/logs" class="btn btn-refresh">🔄 Refresh Logs</a>
+        <a href="/logs/clear" class="btn btn-clear">🗑️ Clear Logs</a>
+      </div>
       ${
         logHistory.length === 0
           ? "<p>No webhook requests received yet...</p>"
