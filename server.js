@@ -1,8 +1,28 @@
 const express = require("express");
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
+
+// ──────────────────────────────────────────────
+//  IN-MEMORY LOG STORAGE (Last 100 logs)
+// ──────────────────────────────────────────────
+const logHistory = [];
+
+function addLog(type, data) {
+  const entry = {
+    time: new Date().toISOString(),
+    type,
+    data,
+  };
+  // 1. Print to Render Console Logs
+  console.log(`[${entry.time}] [${type}]`, JSON.stringify(data));
+
+  // 2. Save for /logs webpage
+  logHistory.unshift(entry);
+  if (logHistory.length > 100) logHistory.pop();
+}
 
 // ──────────────────────────────────────────────
 //  ENCODED WORDS (0–9)
@@ -29,8 +49,6 @@ function speakEncoded(digits) {
 
 // ──────────────────────────────────────────────
 //  STRICT NUMBER WORDS ONLY
-//  (Removed "to", "for", "ate" so normal English
-//   words don't get mistaken for digits)
 // ──────────────────────────────────────────────
 const WORDS = {
   zero: "0",
@@ -46,7 +64,6 @@ const WORDS = {
   nine: "9",
 };
 
-// Extract all digits from a sentence
 function extractDigits(transcript) {
   if (!transcript) return "";
   const tokens = transcript.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -61,7 +78,6 @@ function extractDigits(transcript) {
   return out;
 }
 
-// Specifically look for "press [digit]" (e.g. "press nine" or "press 9")
 function extractPressDigit(transcript) {
   if (!transcript) return null;
   const match = transcript
@@ -106,9 +122,12 @@ setInterval(() => {
 app.post("/webhook", (req, res) => {
   const body = req.body || {};
 
-  // Ignore non-message events
+  // Log raw incoming request from AgentPhone
+  addLog("INCOMING_WEBHOOK", body);
+
   const event = body.event || "";
   if (event && !/message/i.test(event)) {
+    addLog("IGNORED_EVENT", { event });
     return res.json({});
   }
 
@@ -125,45 +144,102 @@ app.post("/webhook", (req, res) => {
 
   // ── PHASE 1: Press the first digit the IVR asks for ──
   if (!state.pressedFirst) {
-    // 1. Try to find "press X" first
     let firstDigit = extractPressDigit(transcript);
     const allDigits = extractDigits(transcript);
 
-    // 2. Fallback: if IVR just said a number without "press", grab the first digit
     if (!firstDigit && allDigits.length > 0) {
       firstDigit = allDigits[0];
     }
 
-    // No digit heard yet — stay silent and wait
     if (!firstDigit) {
+      addLog("NO_DIGIT_FOUND_PHASE_1", { callId, transcript });
       return res.json({});
     }
 
     state.pressedFirst = true;
-    return res.json({ digits: firstDigit });
+    const response = { digits: firstDigit };
+
+    addLog("PRESSED_FIRST_DIGIT", { callId, transcript, response });
+    return res.json(response);
   }
 
   // ── PHASE 2: Capture the next 6 digits & speak encoded ──
   const digits = extractDigits(transcript);
   if (!digits) {
+    addLog("NO_DIGIT_FOUND_PHASE_2", { callId, transcript });
     return res.json({});
   }
 
   state.codeDigits += digits;
+  addLog("ACCUMULATING_DIGITS", {
+    callId,
+    transcript,
+    newDigits: digits,
+    totalCollected: state.codeDigits,
+  });
 
   if (state.codeDigits.length >= 6) {
     const sixDigits = state.codeDigits.slice(0, 6);
-    state.codeDigits = ""; // reset in case IVR repeats the code
-    return res.json({ text: speakEncoded(sixDigits) });
+    state.codeDigits = "";
+    const response = { text: speakEncoded(sixDigits) };
+
+    addLog("SPOKE_ENCODED_DIGITS", { callId, sixDigits, response });
+    return res.json(response);
   }
 
-  // Still waiting for all 6 digits
   return res.json({});
+});
+
+// ──────────────────────────────────────────────
+//  VIEW LOGS IN BROWSER:  GET /logs
+// ──────────────────────────────────────────────
+app.get("/logs", (req, res) => {
+  res.setHeader("Content-Type", "text/html");
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Webhook Logs</title>
+      <meta http-equiv="refresh" content="3">
+      <style>
+        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+        .entry { border-bottom: 1px solid #333; padding: 10px 0; }
+        .time { color: #888; }
+        .type { color: #ff0; font-weight: bold; }
+        pre { margin: 5px 0 0 0; color: #fff; white-space: pre-wrap; }
+      </style>
+    </head>
+    <body>
+      <h2>📡 AgentPhone Webhook Live Logs (Auto-refreshes every 3s)</h2>
+      <p><a href="/logs/clear" style="color:#f55;">[Clear Logs]</a></p>
+      ${
+        logHistory.length === 0
+          ? "<p>No webhook requests received yet...</p>"
+          : logHistory
+              .map(
+                (l) => `
+          <div class="entry">
+            <span class="time">${l.time}</span> 
+            <span class="type">[${l.type}]</span>
+            <pre>${JSON.stringify(l.data, null, 2)}</pre>
+          </div>`
+              )
+              .join("")
+      }
+    </body>
+    </html>
+  `);
+});
+
+// Clear logs endpoint
+app.get("/logs/clear", (req, res) => {
+  logHistory.length = 0;
+  res.redirect("/logs");
 });
 
 // ──────────────────────────────────────────────
 //  HEALTH CHECK
 // ──────────────────────────────────────────────
-app.get("/", (_, res) => res.send("OK"));
+app.get("/", (_, res) => res.send("OK - Visit /logs to see webhook activity"));
 
 app.listen(PORT, () => console.log(`Webhook running on port ${PORT}`));
