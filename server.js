@@ -1,263 +1,170 @@
 const express = require("express");
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
 const PORT = process.env.PORT || 3000;
 
-// ──────────────────────────────────────────────
-//  IN-MEMORY LOG STORAGE (Last 100 logs)
-// ──────────────────────────────────────────────
-const logHistory = [];
-
-function addLog(type, data) {
-  const entry = {
-    time: new Date().toISOString(),
-    type,
-    data,
-  };
-  // 1. Print to Render Console Logs
-  console.log(`[${entry.time}] [${type}]`, JSON.stringify(data));
-
-  // 2. Save for /logs webpage
-  logHistory.unshift(entry);
-  if (logHistory.length > 100) logHistory.pop();
-}
-
-// ──────────────────────────────────────────────
-//  ENCODED WORDS (0–9)
-// ──────────────────────────────────────────────
-const ENCODED = {
-  "0": "Zuri",
-  "1": "Uni",
-  "2": "Tuwi",
-  "3": "Thuri",
-  "4": "Furi",
-  "5": "Fivi",
-  "6": "Siji",
-  "7": "Sivini",
-  "8": "Eigti",
-  "9": "Nini",
+// ── ENCODED WORDS ──
+const ENC = {
+  "0":"Zuri","1":"Uni","2":"Tuwi","3":"Thuri","4":"Furi",
+  "5":"Fivi","6":"Siji","7":"Sivini","8":"Eigti","9":"Nini"
 };
+function encoded(d) { return d.split("").map(c => ENC[c]||c).join(", "); }
 
-function speakEncoded(digits) {
-  return digits
-    .split("")
-    .map((d) => ENCODED[d] || d)
-    .join(", ");
-}
-
-// ──────────────────────────────────────────────
-//  STRICT NUMBER WORDS ONLY
-// ──────────────────────────────────────────────
-const WORDS = {
-  zero: "0",
-  oh: "0",
-  one: "1",
-  two: "2",
-  three: "3",
-  four: "4",
-  five: "5",
-  six: "6",
-  seven: "7",
-  eight: "8",
-  nine: "9",
+// ── DIGIT EXTRACTION ──
+const W = {
+  zero:"0",oh:"0",one:"1",two:"2",three:"3",
+  four:"4",five:"5",six:"6",seven:"7",eight:"8",nine:"9"
 };
-
-function extractDigits(transcript) {
-  if (!transcript) return "";
-  const tokens = transcript.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+function getDigits(text) {
+  if (!text) return "";
   let out = "";
-  for (const t of tokens) {
-    if (/^\d+$/.test(t)) {
-      out += t;
-    } else if (WORDS[t]) {
-      out += WORDS[t];
-    }
+  for (const t of text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)) {
+    if (/^\d+$/.test(t)) out += t;
+    else if (W[t]) out += W[t];
   }
   return out;
 }
-
-function extractPressDigit(transcript) {
-  if (!transcript) return null;
-  const match = transcript
-    .toLowerCase()
-    .match(/\b(?:press|dial|enter|push)\s+([0-9]|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/);
-
-  if (match && match[1]) {
-    const token = match[1];
-    return /^\d$/.test(token) ? token : WORDS[token] || null;
-  }
-  return null;
+function getPressDigit(text) {
+  if (!text) return null;
+  const m = text.toLowerCase().match(
+    /\b(?:press|dial|enter|push)\s+(?:number\s+|digit\s+|the\s+)?([0-9]|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/
+  );
+  if (!m) return null;
+  const t = m[1];
+  return /^\d$/.test(t) ? t : (W[t] || null);
 }
 
-// ──────────────────────────────────────────────
-//  CALL STATE
-// ──────────────────────────────────────────────
+// ── CALL STATE ──
 const calls = new Map();
-
-function getState(callId) {
-  if (!calls.has(callId)) {
-    calls.set(callId, {
-      pressedFirst: false,
-      codeDigits: "",
-      ts: Date.now(),
-    });
-  }
-  const s = calls.get(callId);
-  s.ts = Date.now();
-  return s;
+function getState(id) {
+  if (!calls.has(id)) calls.set(id, { pressed: false, code: "", ts: Date.now() });
+  const s = calls.get(id); s.ts = Date.now(); return s;
 }
+setInterval(() => { const c = Date.now()-300000; for (const [id,s] of calls) if (s.ts<c) calls.delete(id); }, 60000);
 
-setInterval(() => {
-  const cutoff = Date.now() - 5 * 60 * 1000;
-  for (const [id, s] of calls) {
-    if (s.ts < cutoff) calls.delete(id);
-  }
-}, 60 * 1000);
+// ── LOGS ──
+const logs = [];
+const stats = { total:0, pressed:0, spoken:0 };
+function log(badge,color,title,d={}) {
+  const e = { time:new Date().toISOString(), badge, color, title, ...d };
+  console.log(`[${e.time}] [${badge}] ${title}`);
+  logs.unshift(e); if (logs.length>100) logs.pop();
+}
+function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 
-// ──────────────────────────────────────────────
-//  MAIN WEBHOOK  POST /webhook
-// ──────────────────────────────────────────────
+// ══════════════════════════════════════════════
+//  WEBHOOK — ONLY PRESS & SPEAK
+// ══════════════════════════════════════════════
 app.post("/webhook", (req, res) => {
   const body = req.body || {};
+  stats.total++;
+  if (body.event !== "agent.message") return res.json({});
 
-  // Log raw incoming request from AgentPhone
-  addLog("INCOMING_WEBHOOK", body);
-
-  const event = body.event || "";
-  if (event && !/message/i.test(event)) {
-    addLog("IGNORED_EVENT", { event });
-    return res.json({});
-  }
-
-  const data = body.data || body;
-  const callId =
-    data.callId ||
-    data.call_id ||
-    body.callId ||
-    body.sessionId ||
-    "default";
-
-  const transcript = data.transcript || data.text || "";
+  const data = body.data || {};
+  const callId = data.callId || "default";
+  const transcript = data.transcript || "";
   const state = getState(callId);
 
-  // ── PHASE 1: Press the first digit the IVR asks for ──
-  if (!state.pressedFirst) {
-    let firstDigit = extractPressDigit(transcript);
-    const allDigits = extractDigits(transcript);
+  // ── STEP 1: PRESS first digit ──
+  if (!state.pressed) {
+    const digit = getPressDigit(transcript) || getDigits(transcript)[0] || null;
+    if (!digit) return res.json({ text: "Listening." });
 
-    if (!firstDigit && allDigits.length > 0) {
-      firstDigit = allDigits[0];
-    }
+    state.pressed = true;
+    stats.pressed++;
+    log("PRESSED","amber",`Pressed ${digit}`,{ callId, transcript, digit, raw:body });
 
-    if (!firstDigit) {
-      addLog("NO_DIGIT_FOUND_PHASE_1", { callId, transcript });
-      return res.json({});
-    }
-
-    state.pressedFirst = true;
-    const response = { digits: firstDigit };
-
-    addLog("PRESSED_FIRST_DIGIT", { callId, transcript, response });
-    return res.json(response);
+    // Docs require text + digits together
+    return res.json({ text: `Pressing ${digit}.`, digits: digit });
   }
 
-  // ── PHASE 2: Capture the next 6 digits & speak encoded ──
-  const digits = extractDigits(transcript);
-  if (!digits) {
-    addLog("NO_DIGIT_FOUND_PHASE_2", { callId, transcript });
-    return res.json({});
+  // ── STEP 2: SPEAK next digits encoded ──
+  const digits = getDigits(transcript);
+  if (!digits) return res.json({ text: "Listening for code." });
+
+  state.code += digits;
+
+  if (state.code.length >= 6) {
+    const six = state.code.slice(0, 6);
+    state.code = "";
+    stats.spoken++;
+    const spoken = encoded(six);
+    log("SPOKE","green",`Spoke ${six} → ${spoken}`,{ callId, transcript, digits:six, spoken, raw:body });
+    return res.json({ text: spoken });
   }
 
-  state.codeDigits += digits;
-  addLog("ACCUMULATING_DIGITS", {
-    callId,
-    transcript,
-    newDigits: digits,
-    totalCollected: state.codeDigits,
-  });
-
-  if (state.codeDigits.length >= 6) {
-    const sixDigits = state.codeDigits.slice(0, 6);
-    state.codeDigits = "";
-    const response = { text: speakEncoded(sixDigits) };
-
-    addLog("SPOKE_ENCODED_DIGITS", { callId, sixDigits, response });
-    return res.json(response);
-  }
-
-  return res.json({});
+  log("WAITING","blue",`Code ${state.code.length}/6`,{ callId, transcript, raw:body });
+  return res.json({ text: "Listening." });
 });
 
-// ──────────────────────────────────────────────
-//  VIEW LOGS IN BROWSER:  GET /logs
-// ──────────────────────────────────────────────
+// ══════════════════════════════════════════════
+//  DASHBOARD
+// ══════════════════════════════════════════════
 app.get("/logs", (req, res) => {
-  res.setHeader("Content-Type", "text/html");
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Webhook Logs</title>
-      <style>
-        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
-        .toolbar { margin-bottom: 20px; display: flex; gap: 12px; }
-        .btn {
-          padding: 8px 16px;
-          font-family: monospace;
-          font-size: 14px;
-          font-weight: bold;
-          border: none;
-          border-radius: 4px;
-          cursor: pointer;
-          text-decoration: none;
-          display: inline-block;
-        }
-        .btn-refresh { background: #0a0; color: #fff; }
-        .btn-refresh:hover { background: #0c0; }
-        .btn-clear { background: #c00; color: #fff; }
-        .btn-clear:hover { background: #e00; }
-        .entry { border-bottom: 1px solid #333; padding: 10px 0; }
-        .time { color: #888; }
-        .type { color: #ff0; font-weight: bold; }
-        pre { margin: 5px 0 0 0; color: #fff; white-space: pre-wrap; }
-      </style>
-    </head>
-    <body>
-      <h2>📡 AgentPhone Webhook Logs</h2>
-      <div class="toolbar">
-        <a href="/logs" class="btn btn-refresh">🔄 Refresh Logs</a>
-        <a href="/logs/clear" class="btn btn-clear">🗑️ Clear Logs</a>
+  res.setHeader("Content-Type","text/html");
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>AgentPhone Logs</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#09090b;color:#f4f4f5;font-family:-apple-system,sans-serif;padding:24px;max-width:900px;margin:0 auto}
+h1{font-size:20px;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.dot{width:9px;height:9px;background:#10b981;border-radius:50%;box-shadow:0 0 8px #10b981}
+.bar{display:flex;gap:8px;margin-bottom:20px}
+.btn{padding:8px 14px;border-radius:7px;font-size:12px;font-weight:600;text-decoration:none;border:1px solid #27272a}
+.b1{background:#1d4ed8;color:#fff}.b2{background:#18181b;color:#f87171}
+.stats{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
+.sc{background:#121216;border:1px solid #27272a;border-radius:10px;padding:12px 16px;min-width:120px}
+.sl{font-size:10px;color:#a1a1aa;text-transform:uppercase}.sv{font-size:22px;font-weight:700;margin-top:2px}
+.card{background:#121216;border:1px solid #27272a;border-radius:10px;padding:14px;margin-bottom:10px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px}
+.badge{font-size:10px;font-weight:700;padding:3px 8px;border-radius:5px}
+.amber{background:rgba(245,158,11,.15);color:#fbbf24;border:1px solid rgba(245,158,11,.3)}
+.green{background:rgba(16,185,129,.15);color:#34d399;border:1px solid rgba(16,185,129,.3)}
+.blue{background:rgba(59,130,246,.15);color:#60a5fa;border:1px solid rgba(59,130,246,.3)}
+.gray{background:rgba(113,113,122,.15);color:#a1a1aa;border:1px solid rgba(113,113,122,.3)}
+.row{background:#0c0c0e;border:1px solid #1a1a1e;border-radius:6px;padding:8px 12px;font-size:12px;margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.lbl{color:#a1a1aa;min-width:80px}
+.txt{color:#e4e4e7;font-style:italic}
+.key{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;background:#27272a;border:1px solid #3f3f46;border-radius:5px;font-family:monospace;font-size:14px;font-weight:700;color:#fbbf24}
+.enc{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#34d399;padding:4px 8px;border-radius:5px;font-weight:600}
+code{background:#1a1a2e;color:#fbbf24;padding:2px 6px;border-radius:4px;font-size:12px}
+.meta{font-size:11px;color:#71717a;font-family:monospace}
+details{margin-top:6px}summary{font-size:11px;color:#71717a;cursor:pointer}
+pre{margin-top:4px;background:#09090b;border:1px solid #1a1a1e;padding:8px;border-radius:6px;font-size:11px;color:#71717a;overflow-x:auto}
+</style></head><body>
+<h1><span class="dot"></span>AgentPhone — Press & Speak</h1>
+<div class="bar">
+  <a href="/logs" class="btn b1">🔄 Refresh</a>
+  <a href="/logs/clear" class="btn b2">🗑️ Clear</a>
+</div>
+<div class="stats">
+  <div class="sc"><div class="sl">Events</div><div class="sv">${stats.total}</div></div>
+  <div class="sc"><div class="sl">Pressed</div><div class="sv" style="color:#fbbf24">${stats.pressed}</div></div>
+  <div class="sc"><div class="sl">Spoken</div><div class="sv" style="color:#34d399">${stats.spoken}</div></div>
+</div>
+${logs.length===0?'<p style="color:#71717a;text-align:center;padding:40px">No activity yet. Make a call and refresh.</p>'
+:logs.map(l=>{
+  const t=new Date(l.time).toLocaleTimeString();
+  const pills=l.digits?l.digits.split("").map(d=>`<span class="key">${esc(d)}</span>`).join(""):"";
+  return `<div class="card">
+    <div class="top">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="badge ${l.color}">${esc(l.badge)}</span>
+        <strong>${esc(l.title)}</strong>
       </div>
-      ${
-        logHistory.length === 0
-          ? "<p>No webhook requests received yet...</p>"
-          : logHistory
-              .map(
-                (l) => `
-          <div class="entry">
-            <span class="time">${l.time}</span> 
-            <span class="type">[${l.type}]</span>
-            <pre>${JSON.stringify(l.data, null, 2)}</pre>
-          </div>`
-              )
-              .join("")
-      }
-    </body>
-    </html>
-  `);
+      <span class="meta">${t}</span>
+    </div>
+    ${l.transcript?`<div class="row"><span class="lbl">🎙️ Heard:</span><span class="txt">"${esc(l.transcript)}"</span></div>`:""}
+    ${l.digit?`<div class="row"><span class="lbl">📤 Sent:</span><code>{"text":"Pressing ${esc(l.digit)}.","digits":"${esc(l.digit)}"}</code></div>`:""}
+    ${l.digits?`<div class="row"><span class="lbl">🔐 Code:</span><div style="display:flex;gap:4px">${pills}</div></div>`:""}
+    ${l.spoken?`<div class="row"><span class="lbl">🗣️ Spoke:</span><span class="enc">${esc(l.spoken)}</span></div>`:""}
+    <details><summary>Raw</summary><pre>${esc(JSON.stringify(l.raw,null,2))}</pre></details>
+  </div>`;
+}).join("")}
+</body></html>`);
 });
 
-// Clear logs endpoint
-app.get("/logs/clear", (req, res) => {
-  logHistory.length = 0;
-  res.redirect("/logs");
-});
-
-// ──────────────────────────────────────────────
-//  HEALTH CHECK
-// ──────────────────────────────────────────────
-app.get("/", (_, res) => res.send("OK - Visit /logs to see webhook activity"));
-
-app.listen(PORT, () => console.log(`Webhook running on port ${PORT}`));
+app.get("/logs/clear",(req,res)=>{ logs.length=0; stats.total=0; stats.pressed=0; stats.spoken=0; res.redirect("/logs"); });
+app.get("/",(_,res)=>res.redirect("/logs"));
+app.listen(PORT,()=>console.log(`Webhook on port ${PORT}`));
