@@ -2,7 +2,7 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Track active and recent call states with history
+// Track active call states
 const callStates = {};
 
 const ENCODING_TABLE = {
@@ -48,7 +48,7 @@ app.post('/webhook', (req, res) => {
         if (!callStates[callId]) {
             callStates[callId] = {
                 call_id: callId,
-                phase: 1,
+                phase: 1, // Start strictly at Phase 1
                 captured_digits: [],
                 last_processed_text: "",
                 transcript: transcript,
@@ -74,19 +74,24 @@ app.post('/webhook', (req, res) => {
         if (state.phase === 1) {
             if (allFoundDigits.length > 0) {
                 const firstDigit = allFoundDigits[0];
-                state.phase = 2;
+                state.phase = 2; // Advance to Phase 2 ONLY after capturing/pressing the first digit
                 
+                // If extra digits were spoken in the same sentence, queue them for Phase 2
                 const remainingDigits = allFoundDigits.slice(1);
                 if (remainingDigits.length > 0) {
                     state.captured_digits.push(...remainingDigits);
                 }
 
+                console.log(`[Phase 1] Pressing first digit: ${firstDigit}`);
+
+                // Return ONLY the press_digit action. DO NOT include end_call here.
                 return res.json({
                     action: "press_digit",
                     digit: firstDigit,
                     text: ""
                 });
             }
+            // Keep listening silently if no digit is found yet
             return res.json({ text: "" });
         }
 
@@ -98,12 +103,16 @@ app.post('/webhook', (req, res) => {
             const needed = 6 - currentCount;
             
             if (needed > 0 && allFoundDigits.length > 0) {
+                // Ensure we pull new digits beyond what was already gathered
                 const newDigits = allFoundDigits.slice(currentCount);
                 if (newDigits.length > 0) {
                     state.captured_digits.push(...newDigits.slice(0, needed));
                 }
             }
 
+            console.log(`[Phase 2] Captured digits count: ${state.captured_digits.length}/6 -> [${state.captured_digits.join('')}]`);
+
+            // Only trigger encoding and hanging up once we have EXACTLY 6 digits
             if (state.captured_digits.length >= 6) {
                 const sixDigits = state.captured_digits.slice(0, 6);
                 state.phase = 3;
@@ -113,11 +122,14 @@ app.post('/webhook', (req, res) => {
                 const responseText = encodedWords.join(" ");
                 state.final_response = responseText;
                 
+                console.log(`[Phase 3] Speaking words and ending call: ${responseText}`);
+
                 return res.json({
                     text: responseText,
                     end_call: true
                 });
             } else {
+                // Still collecting digits, stay silent
                 return res.json({ text: "" });
             }
         }
