@@ -1,14 +1,12 @@
 const express = require("express");
-
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 
-/* ============================================================
-   ENCODED DIGIT WORDS (0-9)
-   ============================================================ */
+// ──────────────────────────────────────────────
+//  ENCODED WORDS (0–9)
+// ──────────────────────────────────────────────
 const ENCODED = {
   "0": "Zuri",
   "1": "Uni",
@@ -22,23 +20,21 @@ const ENCODED = {
   "9": "Nini",
 };
 
-function encodeDigits(digits) {
+function speakEncoded(digits) {
   return digits
     .split("")
     .map((d) => ENCODED[d] || d)
     .join(", ");
 }
 
-/* ============================================================
-   TRANSCRIPT → DIGITS
-   Extracts digits from natural IVR speech like:
-     "press nine"                  → "9"
-     "your code is 4 8 2 7 1 3"   → "482713"
-     "press one"                   → "1"
-     "dial five"                   → "5"
-   ============================================================ */
-const WORD_TO_DIGIT = {
+// ──────────────────────────────────────────────
+//  STRICT NUMBER WORDS ONLY
+//  (Removed "to", "for", "ate" so normal English
+//   words don't get mistaken for digits)
+// ──────────────────────────────────────────────
+const WORDS = {
   zero: "0",
+  oh: "0",
   one: "1",
   two: "2",
   three: "3",
@@ -48,34 +44,47 @@ const WORD_TO_DIGIT = {
   seven: "7",
   eight: "8",
   nine: "9",
-  // encoded words (in case they echo back)
-  zuri: "0", uni: "1", tuwi: "2", thuri: "3",
-  furi: "4", fivi: "5", siji: "6", sivini: "7",
-  eigti: "8", nini: "9",
 };
 
-function extractDigits(text) {
-  if (!text) return "";
-  const tokens = String(text).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+// Extract all digits from a sentence
+function extractDigits(transcript) {
+  if (!transcript) return "";
+  const tokens = transcript.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   let out = "";
   for (const t of tokens) {
-    const nums = t.match(/\d/g);
-    if (nums) { out += nums.join(""); continue; }
-    if (WORD_TO_DIGIT[t]) out += WORD_TO_DIGIT[t];
+    if (/^\d+$/.test(t)) {
+      out += t;
+    } else if (WORDS[t]) {
+      out += WORDS[t];
+    }
   }
   return out;
 }
 
-/* ============================================================
-   PER-CALL STATE
-   ============================================================ */
+// Specifically look for "press [digit]" (e.g. "press nine" or "press 9")
+function extractPressDigit(transcript) {
+  if (!transcript) return null;
+  const match = transcript
+    .toLowerCase()
+    .match(/\b(?:press|dial|enter|push)\s+([0-9]|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/);
+
+  if (match && match[1]) {
+    const token = match[1];
+    return /^\d$/.test(token) ? token : WORDS[token] || null;
+  }
+  return null;
+}
+
+// ──────────────────────────────────────────────
+//  CALL STATE
+// ──────────────────────────────────────────────
 const calls = new Map();
 
 function getState(callId) {
   if (!calls.has(callId)) {
     calls.set(callId, {
-      firstPressed: false,
-      capturedDigits: "",   // digits after the first press
+      pressedFirst: false,
+      codeDigits: "",
       ts: Date.now(),
     });
   }
@@ -84,7 +93,6 @@ function getState(callId) {
   return s;
 }
 
-// Evict stale calls every 5 min
 setInterval(() => {
   const cutoff = Date.now() - 5 * 60 * 1000;
   for (const [id, s] of calls) {
@@ -92,104 +100,70 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-/* ============================================================
-   WEBHOOK  POST /webhook
-
-   REAL-WORLD FLOW:
-   ─────────────────────────────────────────────
-   IVR: "To receive your WhatsApp verification
-         code, press nine"
-   → transcript contains "nine"
-   → extractDigits → "9"
-   → firstPressed = false → PRESS "9"
-   → response: { "digits": "9" }
-
-   IVR: "Your verification code is
-         four eight two seven one three"
-   → transcript contains "four eight two seven one three"
-   → extractDigits → "482713"
-   → firstPressed = true → SPEAK encoded
-   → response: { "text": "Furi, Eigti, Tuwi, Sivini, Uni, Thuri" }
-   ─────────────────────────────────────────────
-   ============================================================ */
+// ──────────────────────────────────────────────
+//  MAIN WEBHOOK  POST /webhook
+// ──────────────────────────────────────────────
 app.post("/webhook", (req, res) => {
   const body = req.body || {};
 
   // Ignore non-message events
-  const event = body.event || body.type || "";
+  const event = body.event || "";
   if (event && !/message/i.test(event)) {
     return res.json({});
   }
 
   const data = body.data || body;
   const callId =
-    data.callId || data.call_id || body.callId || body.sessionId || "default";
+    data.callId ||
+    data.call_id ||
+    body.callId ||
+    body.sessionId ||
+    "default";
+
   const transcript = data.transcript || data.text || "";
-  const rawDigits = data.digits || "";
+  const state = getState(callId);
 
-  let digits = extractDigits(transcript);
-  if (!digits && rawDigits) digits = rawDigits.replace(/\D/g, "");
+  // ── PHASE 1: Press the first digit the IVR asks for ──
+  if (!state.pressedFirst) {
+    // 1. Try to find "press X" first
+    let firstDigit = extractPressDigit(transcript);
+    const allDigits = extractDigits(transcript);
 
-  // No digits in this utterance — stay silent, keep listening
+    // 2. Fallback: if IVR just said a number without "press", grab the first digit
+    if (!firstDigit && allDigits.length > 0) {
+      firstDigit = allDigits[0];
+    }
+
+    // No digit heard yet — stay silent and wait
+    if (!firstDigit) {
+      return res.json({});
+    }
+
+    state.pressedFirst = true;
+    return res.json({ digits: firstDigit });
+  }
+
+  // ── PHASE 2: Capture the next 6 digits & speak encoded ──
+  const digits = extractDigits(transcript);
   if (!digits) {
     return res.json({});
   }
 
-  const state = getState(callId);
+  state.codeDigits += digits;
 
-  /* ----------------------------------------------------------
-     PHASE 1: IVR says "press nine" (or any first digit)
-     → Press that digit via DTMF
-     → If more digits follow in same utterance, capture them
-     ---------------------------------------------------------- */
-  if (!state.firstPressed) {
-    const firstDigit = digits[0];
-    state.firstPressed = true;
-
-    const remaining = digits.slice(1);
-
-    // Case A: "press nine" → only 1 digit → just press it
-    if (remaining.length === 0) {
-      return res.json({ digits: firstDigit });
-    }
-
-    // Case B: all 7 digits in one utterance → press first, speak next 6
-    if (remaining.length >= 6) {
-      const six = remaining.slice(0, 6);
-      state.capturedDigits = six;
-      return res.json({
-        digits: firstDigit,
-        text: encodeDigits(six),
-      });
-    }
-
-    // Case C: some extra digits but not 6 yet → press first, store rest
-    state.capturedDigits = remaining;
-    return res.json({ digits: firstDigit });
+  if (state.codeDigits.length >= 6) {
+    const sixDigits = state.codeDigits.slice(0, 6);
+    state.codeDigits = ""; // reset in case IVR repeats the code
+    return res.json({ text: speakEncoded(sixDigits) });
   }
 
-  /* ----------------------------------------------------------
-     PHASE 2: IVR reads the verification code
-     → Accumulate digits until we have 6
-     → Speak all 6 as encoded words
-     ---------------------------------------------------------- */
-  state.capturedDigits += digits;
-
-  if (state.capturedDigits.length >= 6) {
-    const six = state.capturedDigits.slice(0, 6);
-    return res.json({ text: encodeDigits(six) });
-  }
-
-  // Not 6 yet — stay silent, keep listening for more
+  // Still waiting for all 6 digits
   return res.json({});
 });
 
-/* ============================================================
-   HEALTH CHECK
-   ============================================================ */
-app.get("/", (_req, res) => res.send("AgentPhone webhook OK"));
-app.get("/webhook", (_req, res) => res.json({ ok: true }));
+// ──────────────────────────────────────────────
+//  HEALTH CHECK
+// ──────────────────────────────────────────────
+app.get("/", (_, res) => res.send("OK"));
 
-app.listen(PORT, () => {
-  console.log(`Webhook listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Webhook running on port ${PORT}`));
