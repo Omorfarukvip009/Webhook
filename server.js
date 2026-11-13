@@ -6,22 +6,51 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 
 // ──────────────────────────────────────────────
-//  IN-MEMORY LOG STORAGE (Last 100 logs)
+//  STRUCTURED LOG STORAGE (Last 100 events)
 // ──────────────────────────────────────────────
 const logHistory = [];
+const stats = {
+  totalRequests: 0,
+  digitsPressed: 0,
+  codesSpoken: 0,
+};
 
-function addLog(type, data) {
+function addLog({
+  badge,
+  color,
+  title,
+  callId = "—",
+  transcript = "",
+  pressedDigit = "",
+  collectedDigits = "",
+  encodedText = "",
+  raw = {},
+}) {
   const entry = {
+    id: Date.now() + Math.random().toString(36).slice(2, 6),
     time: new Date().toISOString(),
-    type,
-    data,
+    badge,
+    color, // "blue" | "amber" | "green" | "purple" | "gray"
+    title,
+    callId,
+    transcript,
+    pressedDigit,
+    collectedDigits,
+    encodedText,
+    raw,
   };
-  // 1. Print to Render Console Logs
-  console.log(`[${entry.time}] [${type}]`, JSON.stringify(data));
 
-  // 2. Save for /logs webpage
+  console.log(`[${entry.time}] [${badge}] ${title} (Call: ${callId})`);
   logHistory.unshift(entry);
   if (logHistory.length > 100) logHistory.pop();
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 // ──────────────────────────────────────────────
@@ -82,7 +111,9 @@ function extractPressDigit(transcript) {
   if (!transcript) return null;
   const match = transcript
     .toLowerCase()
-    .match(/\b(?:press|dial|enter|push)\s+([0-9]|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/);
+    .match(
+      /\b(?:press|dial|enter|push)\s+([0-9]|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/
+    );
 
   if (match && match[1]) {
     const token = match[1];
@@ -121,16 +152,9 @@ setInterval(() => {
 // ──────────────────────────────────────────────
 app.post("/webhook", (req, res) => {
   const body = req.body || {};
-
-  // Log raw incoming request from AgentPhone
-  addLog("INCOMING_WEBHOOK", body);
+  stats.totalRequests++;
 
   const event = body.event || "";
-  if (event && !/message/i.test(event)) {
-    addLog("IGNORED_EVENT", { event });
-    return res.json({});
-  }
-
   const data = body.data || body;
   const callId =
     data.callId ||
@@ -138,6 +162,18 @@ app.post("/webhook", (req, res) => {
     body.callId ||
     body.sessionId ||
     "default";
+
+  // Ignore non-message events
+  if (event && !/message/i.test(event)) {
+    addLog({
+      badge: "EVENT",
+      color: "gray",
+      title: `System Event: ${event}`,
+      callId,
+      raw: body,
+    });
+    return res.json({});
+  }
 
   const transcript = data.transcript || data.text || "";
   const state = getState(callId);
@@ -152,112 +188,421 @@ app.post("/webhook", (req, res) => {
     }
 
     if (!firstDigit) {
-      addLog("NO_DIGIT_FOUND_PHASE_1", { callId, transcript });
+      addLog({
+        badge: "LISTENING",
+        color: "blue",
+        title: "Speech received (waiting for first digit to press)",
+        callId,
+        transcript,
+        raw: body,
+      });
       return res.json({});
     }
 
     state.pressedFirst = true;
+    stats.digitsPressed++;
     const response = { digits: firstDigit };
 
-    addLog("PRESSED_FIRST_DIGIT", { callId, transcript, response });
+    addLog({
+      badge: "DTMF PRESSED",
+      color: "amber",
+      title: `Pressed keypad digit "${firstDigit}"`,
+      callId,
+      transcript,
+      pressedDigit: firstDigit,
+      raw: { request: body, response },
+    });
+
     return res.json(response);
   }
 
   // ── PHASE 2: Capture the next 6 digits & speak encoded ──
   const digits = extractDigits(transcript);
   if (!digits) {
-    addLog("NO_DIGIT_FOUND_PHASE_2", { callId, transcript });
+    addLog({
+      badge: "LISTENING",
+      color: "blue",
+      title: "Speech received (no code digits detected)",
+      callId,
+      transcript,
+      raw: body,
+    });
     return res.json({});
   }
 
   state.codeDigits += digits;
-  addLog("ACCUMULATING_DIGITS", {
-    callId,
-    transcript,
-    newDigits: digits,
-    totalCollected: state.codeDigits,
-  });
 
   if (state.codeDigits.length >= 6) {
     const sixDigits = state.codeDigits.slice(0, 6);
     state.codeDigits = "";
-    const response = { text: speakEncoded(sixDigits) };
+    const encodedText = speakEncoded(sixDigits);
+    const response = { text: encodedText };
+    stats.codesSpoken++;
 
-    addLog("SPOKE_ENCODED_DIGITS", { callId, sixDigits, response });
+    addLog({
+      badge: "SPOKE ENCODED",
+      color: "green",
+      title: "Captured 6-digit code & spoke encoded words",
+      callId,
+      transcript,
+      collectedDigits: sixDigits,
+      encodedText,
+      raw: { request: body, response },
+    });
+
     return res.json(response);
   }
+
+  addLog({
+    badge: "COLLECTING",
+    color: "purple",
+    title: `Collecting code digits (${state.codeDigits.length}/6 captured)`,
+    callId,
+    transcript,
+    collectedDigits: state.codeDigits,
+    raw: body,
+  });
 
   return res.json({});
 });
 
 // ──────────────────────────────────────────────
-//  VIEW LOGS IN BROWSER:  GET /logs
+//  PROFESSIONAL DASHBOARD:  GET /logs
 // ──────────────────────────────────────────────
 app.get("/logs", (req, res) => {
   res.setHeader("Content-Type", "text/html");
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Webhook Logs</title>
-      <style>
-        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
-        .toolbar { margin-bottom: 20px; display: flex; gap: 12px; }
-        .btn {
-          padding: 8px 16px;
-          font-family: monospace;
-          font-size: 14px;
-          font-weight: bold;
-          border: none;
-          border-radius: 4px;
-          cursor: pointer;
-          text-decoration: none;
-          display: inline-block;
-        }
-        .btn-refresh { background: #0a0; color: #fff; }
-        .btn-refresh:hover { background: #0c0; }
-        .btn-clear { background: #c00; color: #fff; }
-        .btn-clear:hover { background: #e00; }
-        .entry { border-bottom: 1px solid #333; padding: 10px 0; }
-        .time { color: #888; }
-        .type { color: #ff0; font-weight: bold; }
-        pre { margin: 5px 0 0 0; color: #fff; white-space: pre-wrap; }
-      </style>
-    </head>
-    <body>
-      <h2>📡 AgentPhone Webhook Logs</h2>
-      <div class="toolbar">
-        <a href="/logs" class="btn btn-refresh">🔄 Refresh Logs</a>
-        <a href="/logs/clear" class="btn btn-clear">🗑️ Clear Logs</a>
-      </div>
-      ${
-        logHistory.length === 0
-          ? "<p>No webhook requests received yet...</p>"
-          : logHistory
-              .map(
-                (l) => `
-          <div class="entry">
-            <span class="time">${l.time}</span> 
-            <span class="type">[${l.type}]</span>
-            <pre>${JSON.stringify(l.data, null, 2)}</pre>
-          </div>`
-              )
-              .join("")
-      }
-    </body>
-    </html>
-  `);
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgentPhone Webhook Dashboard</title>
+  <style>
+    :root {
+      --bg: #09090b;
+      --card: #121216;
+      --card-border: #27272a;
+      --text: #f4f4f5;
+      --muted: #a1a1aa;
+      --blue: #3b82f6;
+      --amber: #f59e0b;
+      --green: #10b981;
+      --purple: #8b5cf6;
+      --gray: #71717a;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 28px 20px;
+      max-width: 1050px;
+      margin: 0 auto;
+    }
+    /* Header */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 24px;
+    }
+    .title-group h1 {
+      font-size: 22px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      background: var(--green);
+      border-radius: 50%;
+      box-shadow: 0 0 10px var(--green);
+    }
+    .title-group p {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 4px;
+    }
+    .actions { display: flex; gap: 10px; }
+    .btn {
+      padding: 9px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      text-decoration: none;
+      border: 1px solid var(--card-border);
+      transition: 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn-refresh {
+      background: #1d4ed8;
+      border-color: #2563eb;
+      color: #fff;
+    }
+    .btn-refresh:hover { background: #2563eb; }
+    .btn-clear {
+      background: #18181b;
+      color: #f87171;
+      border-color: #3f1d1d;
+    }
+    .btn-clear:hover { background: #271515; }
+
+    /* Stats Grid */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 14px;
+      margin-bottom: 26px;
+    }
+    .stat-card {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 16px 18px;
+    }
+    .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat-value { font-size: 26px; font-weight: 700; margin-top: 6px; }
+
+    /* Log Feed */
+    .feed { display: flex; flex-direction: column; gap: 14px; }
+    .log-card {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 18px 20px;
+      transition: border-color 0.15s;
+    }
+    .log-card:hover { border-color: #3f3f46; }
+    .log-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .log-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .badge {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 9px;
+      border-radius: 6px;
+      letter-spacing: 0.4px;
+    }
+    .badge-blue   { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
+    .badge-amber  { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+    .badge-green  { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+    .badge-purple { background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
+    .badge-gray   { background: rgba(113,113,122,0.15); color: #a1a1aa; border: 1px solid rgba(113,113,122,0.3); }
+
+    .log-title { font-size: 15px; font-weight: 600; color: #fff; }
+    .meta { font-size: 12px; color: var(--muted); font-family: monospace; }
+
+    /* Content Boxes inside Card */
+    .info-grid {
+      display: grid;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .info-row {
+      background: #0c0c0e;
+      border: 1px solid #1f1f23;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .info-label {
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 110px;
+      font-weight: 500;
+    }
+    .transcript-text { color: #e4e4e7; font-style: italic; }
+    .key-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      background: #27272a;
+      border: 1px solid #3f3f46;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 15px;
+      font-weight: 700;
+      color: #fbbf24;
+    }
+    .encoded-pill {
+      background: rgba(16,185,129,0.12);
+      border: 1px solid rgba(16,185,129,0.3);
+      color: #34d399;
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    /* Raw JSON Accordion */
+    details { margin-top: 10px; }
+    summary {
+      font-size: 12px;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+    }
+    summary:hover { color: #fff; }
+    pre {
+      margin-top: 8px;
+      background: #09090b;
+      border: 1px solid #222;
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      color: #a1a1aa;
+      overflow-x: auto;
+    }
+    .empty {
+      text-align: center;
+      padding: 60px 20px;
+      background: var(--card);
+      border: 1px dashed var(--card-border);
+      border-radius: 12px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="title-group">
+      <h1><span class="status-dot"></span> AgentPhone Webhook Activity</h1>
+      <p>Real-time IVR DTMF press & encoded verification code monitor</p>
+    </div>
+    <div class="actions">
+      <a href="/logs" class="btn btn-refresh">🔄 Refresh Logs</a>
+      <a href="/logs/clear" class="btn btn-clear">🗑️ Clear Logs</a>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card">
+      <div class="stat-label">Total Webhook Events</div>
+      <div class="stat-value">${stats.totalRequests}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Active Calls in Memory</div>
+      <div class="stat-value">${calls.size}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">First Digits Pressed</div>
+      <div class="stat-value" style="color: var(--amber)">${stats.digitsPressed}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Encoded Codes Spoken</div>
+      <div class="stat-value" style="color: var(--green)">${stats.codesSpoken}</div>
+    </div>
+  </div>
+
+  <div class="feed">
+    ${
+      logHistory.length === 0
+        ? `<div class="empty">
+             <h3>No webhook activity yet</h3>
+             <p style="margin-top:6px;font-size:13px;">Make a call and click "Refresh Logs" to inspect incoming events.</p>
+           </div>`
+        : logHistory
+            .map((l) => {
+              const formattedTime = new Date(l.time).toLocaleTimeString();
+              const digitPills = l.collectedDigits
+                ? l.collectedDigits
+                    .split("")
+                    .map((d) => `<span class="key-pill">${escapeHtml(d)}</span>`)
+                    .join("")
+                : "";
+
+              return `
+        <div class="log-card">
+          <div class="log-top">
+            <div class="log-left">
+              <span class="badge badge-${l.color}">${escapeHtml(l.badge)}</span>
+              <span class="log-title">${escapeHtml(l.title)}</span>
+            </div>
+            <div class="meta">Call: ${escapeHtml(l.callId)} • ${formattedTime}</div>
+          </div>
+
+          <div class="info-grid">
+            ${
+              l.transcript
+                ? `<div class="info-row">
+                     <span class="info-label">🎙️ IVR Heard:</span>
+                     <span class="transcript-text">"${escapeHtml(l.transcript)}"</span>
+                   </div>`
+                : ""
+            }
+            ${
+              l.pressedDigit
+                ? `<div class="info-row">
+                     <span class="info-label">🔢 Keypad Sent:</span>
+                     <span class="key-pill">${escapeHtml(l.pressedDigit)}</span>
+                   </div>`
+                : ""
+            }
+            ${
+              l.collectedDigits
+                ? `<div class="info-row">
+                     <span class="info-label">🔐 Captured Code:</span>
+                     <div style="display:flex;gap:6px;">${digitPills}</div>
+                   </div>`
+                : ""
+            }
+            ${
+              l.encodedText
+                ? `<div class="info-row">
+                     <span class="info-label">🗣️ Agent Spoke:</span>
+                     <span class="encoded-pill">${escapeHtml(l.encodedText)}</span>
+                   </div>`
+                : ""
+            }
+          </div>
+
+          <details>
+            <summary>View Raw Payload</summary>
+            <pre>${escapeHtml(JSON.stringify(l.raw, null, 2))}</pre>
+          </details>
+        </div>`;
+            })
+            .join("")
+    }
+  </div>
+
+</body>
+</html>`);
 });
 
 // Clear logs endpoint
 app.get("/logs/clear", (req, res) => {
   logHistory.length = 0;
+  stats.totalRequests = 0;
+  stats.digitsPressed = 0;
+  stats.codesSpoken = 0;
   res.redirect("/logs");
 });
 
 // ──────────────────────────────────────────────
 //  HEALTH CHECK
 // ──────────────────────────────────────────────
-app.get("/", (_, res) => res.send("OK - Visit /logs to see webhook activity"));
+app.get("/", (_, res) => res.redirect("/logs"));
 
 app.listen(PORT, () => console.log(`Webhook running on port ${PORT}`));
