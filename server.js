@@ -5,6 +5,11 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 
+// Wait 1000ms (1 second) before pressing the digit so the IVR finishes talking
+const DTMF_DELAY_MS = 1000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // ──────────────────────────────────────────────
 //  STRUCTURED LOG STORAGE (Last 100 events)
 // ──────────────────────────────────────────────
@@ -30,7 +35,7 @@ function addLog({
     id: Date.now() + Math.random().toString(36).slice(2, 6),
     time: new Date().toISOString(),
     badge,
-    color, // "blue" | "amber" | "green" | "purple" | "gray"
+    color,
     title,
     callId,
     transcript,
@@ -107,12 +112,13 @@ function extractDigits(transcript) {
   return out;
 }
 
+// Detects "press nine", "press 9", "dial 1", etc.
 function extractPressDigit(transcript) {
   if (!transcript) return null;
   const match = transcript
     .toLowerCase()
     .match(
-      /\b(?:press|dial|enter|push)\s+([0-9]|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/
+      /\b(?:press|dial|enter|push|key)\s+(?:number\s+|digit\s+|the\s+)?([0-9]|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/
     );
 
   if (match && match[1]) {
@@ -150,7 +156,7 @@ setInterval(() => {
 // ──────────────────────────────────────────────
 //  MAIN WEBHOOK  POST /webhook
 // ──────────────────────────────────────────────
-app.post("/webhook", (req, res) => {
+app.post("/webhook", async (req, res) => {
   const body = req.body || {};
   stats.totalRequests++;
 
@@ -178,16 +184,42 @@ app.post("/webhook", (req, res) => {
   const transcript = data.transcript || data.text || "";
   const state = getState(callId);
 
-  // ── PHASE 1: Press the first digit the IVR asks for ──
+  // ── 1. ALWAYS check if IVR explicitly says "press [digit]" ──
+  // (Even if it repeats the prompt, we will press it again!)
+  const explicitPressDigit = extractPressDigit(transcript);
+
+  if (explicitPressDigit) {
+    state.pressedFirst = true;
+    stats.digitsPressed++;
+
+    // Wait 1 second so the IVR finishes its sentence and listens for DTMF
+    await sleep(DTMF_DELAY_MS);
+
+    // Send all 3 valid AgentPhone DTMF fields for maximum compatibility
+    const response = {
+      digits: explicitPressDigit,
+      press_digit: explicitPressDigit,
+      dtmf: explicitPressDigit,
+    };
+
+    addLog({
+      badge: "DTMF PRESSED",
+      color: "amber",
+      title: `Pressed keypad digit "${explicitPressDigit}" (after ${DTMF_DELAY_MS}ms delay)`,
+      callId,
+      transcript,
+      pressedDigit: explicitPressDigit,
+      raw: { request: body, response },
+    });
+
+    return res.json(response);
+  }
+
+  // ── 2. Fallback: If first digit hasn't been pressed yet & caller/IVR just said a number ──
   if (!state.pressedFirst) {
-    let firstDigit = extractPressDigit(transcript);
     const allDigits = extractDigits(transcript);
 
-    if (!firstDigit && allDigits.length > 0) {
-      firstDigit = allDigits[0];
-    }
-
-    if (!firstDigit) {
+    if (allDigits.length === 0) {
       addLog({
         badge: "LISTENING",
         color: "blue",
@@ -199,14 +231,22 @@ app.post("/webhook", (req, res) => {
       return res.json({});
     }
 
+    const firstDigit = allDigits[0];
     state.pressedFirst = true;
     stats.digitsPressed++;
-    const response = { digits: firstDigit };
+
+    await sleep(DTMF_DELAY_MS);
+
+    const response = {
+      digits: firstDigit,
+      press_digit: firstDigit,
+      dtmf: firstDigit,
+    };
 
     addLog({
       badge: "DTMF PRESSED",
       color: "amber",
-      title: `Pressed keypad digit "${firstDigit}"`,
+      title: `Pressed keypad digit "${firstDigit}" (after ${DTMF_DELAY_MS}ms delay)`,
       callId,
       transcript,
       pressedDigit: firstDigit,
@@ -216,7 +256,7 @@ app.post("/webhook", (req, res) => {
     return res.json(response);
   }
 
-  // ── PHASE 2: Capture the next 6 digits & speak encoded ──
+  // ── 3. PHASE 2: Capture the next 6 digits & speak encoded ──
   const digits = extractDigits(transcript);
   if (!digits) {
     addLog({
@@ -299,7 +339,6 @@ app.get("/logs", (req, res) => {
       max-width: 1050px;
       margin: 0 auto;
     }
-    /* Header */
     .header {
       display: flex;
       justify-content: space-between;
@@ -324,11 +363,7 @@ app.get("/logs", (req, res) => {
       border-radius: 50%;
       box-shadow: 0 0 10px var(--green);
     }
-    .title-group p {
-      color: var(--muted);
-      font-size: 13px;
-      margin-top: 4px;
-    }
+    .title-group p { color: var(--muted); font-size: 13px; margin-top: 4px; }
     .actions { display: flex; gap: 10px; }
     .btn {
       padding: 9px 16px;
@@ -342,20 +377,10 @@ app.get("/logs", (req, res) => {
       align-items: center;
       gap: 6px;
     }
-    .btn-refresh {
-      background: #1d4ed8;
-      border-color: #2563eb;
-      color: #fff;
-    }
+    .btn-refresh { background: #1d4ed8; border-color: #2563eb; color: #fff; }
     .btn-refresh:hover { background: #2563eb; }
-    .btn-clear {
-      background: #18181b;
-      color: #f87171;
-      border-color: #3f1d1d;
-    }
+    .btn-clear { background: #18181b; color: #f87171; border-color: #3f1d1d; }
     .btn-clear:hover { background: #271515; }
-
-    /* Stats Grid */
     .stats {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -370,17 +395,13 @@ app.get("/logs", (req, res) => {
     }
     .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .stat-value { font-size: 26px; font-weight: 700; margin-top: 6px; }
-
-    /* Log Feed */
     .feed { display: flex; flex-direction: column; gap: 14px; }
     .log-card {
       background: var(--card);
       border: 1px solid var(--card-border);
       border-radius: 12px;
       padding: 18px 20px;
-      transition: border-color 0.15s;
     }
-    .log-card:hover { border-color: #3f3f46; }
     .log-top {
       display: flex;
       justify-content: space-between;
@@ -402,16 +423,9 @@ app.get("/logs", (req, res) => {
     .badge-green  { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
     .badge-purple { background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
     .badge-gray   { background: rgba(113,113,122,0.15); color: #a1a1aa; border: 1px solid rgba(113,113,122,0.3); }
-
     .log-title { font-size: 15px; font-weight: 600; color: #fff; }
     .meta { font-size: 12px; color: var(--muted); font-family: monospace; }
-
-    /* Content Boxes inside Card */
-    .info-grid {
-      display: grid;
-      gap: 10px;
-      margin-top: 10px;
-    }
+    .info-grid { display: grid; gap: 10px; margin-top: 10px; }
     .info-row {
       background: #0c0c0e;
       border: 1px solid #1f1f23;
@@ -423,12 +437,7 @@ app.get("/logs", (req, res) => {
       gap: 10px;
       flex-wrap: wrap;
     }
-    .info-label {
-      color: var(--muted);
-      font-size: 12px;
-      min-width: 110px;
-      font-weight: 500;
-    }
+    .info-label { color: var(--muted); font-size: 12px; min-width: 110px; font-weight: 500; }
     .transcript-text { color: #e4e4e7; font-style: italic; }
     .key-pill {
       display: inline-flex;
@@ -453,15 +462,8 @@ app.get("/logs", (req, res) => {
       font-weight: 600;
       font-size: 14px;
     }
-
-    /* Raw JSON Accordion */
     details { margin-top: 10px; }
-    summary {
-      font-size: 12px;
-      color: var(--muted);
-      cursor: pointer;
-      user-select: none;
-    }
+    summary { font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
     summary:hover { color: #fff; }
     pre {
       margin-top: 8px;
@@ -591,7 +593,6 @@ app.get("/logs", (req, res) => {
 </html>`);
 });
 
-// Clear logs endpoint
 app.get("/logs/clear", (req, res) => {
   logHistory.length = 0;
   stats.totalRequests = 0;
@@ -600,9 +601,6 @@ app.get("/logs/clear", (req, res) => {
   res.redirect("/logs");
 });
 
-// ──────────────────────────────────────────────
-//  HEALTH CHECK
-// ──────────────────────────────────────────────
 app.get("/", (_, res) => res.redirect("/logs"));
 
 app.listen(PORT, () => console.log(`Webhook running on port ${PORT}`));
