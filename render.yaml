@@ -1,0 +1,16 @@
+{
+  "name": "agentphone-encoded-webhook",
+  "version": "1.0.0",
+  "description": "AgentPhone webhook: press first digit via DTMF, speak remaining digits as encoded words",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
